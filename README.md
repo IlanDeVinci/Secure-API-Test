@@ -1,4 +1,4 @@
-# express-turso-api
+# Secure API Test
 
 Small Express API that integrates with Shopify and a Turso (SQLite-compatible) DB. This README gives a concise setup guide, explains the main endpoints (including the bulk product upload), and highlights important permission/behavior notes.
 

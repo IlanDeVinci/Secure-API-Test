@@ -23,7 +23,60 @@ export const createApiKeys = async (req, res) => {
   const created = [];
 
   try {
+    // Determine the creator's effective permissions so we can ensure
+    // they cannot grant permissions they don't have.
+    let creatorPerms = [];
+    let creatorHasAll = false;
+    if (req.user?.is_api_key) {
+      creatorPerms = Array.isArray(req.user.permissions)
+        ? req.user.permissions
+        : [];
+      creatorHasAll = creatorPerms.includes("all");
+    } else {
+      // Resolve role permissions for the authenticated user
+      const roleRes = await turso.execute({
+        sql: "SELECT r.* FROM roles r JOIN users u ON u.role_id = r.id WHERE u.id = ? LIMIT 1",
+        args: [req.user.id],
+      });
+      const roleRow = roleRes.rows[0] || {};
+      // Build permission names from columns like `can_<permission>`
+      creatorPerms = Object.keys(roleRow)
+        .filter((k) => k.startsWith("can_"))
+        .filter((k) => {
+          const v = roleRow[k];
+          return (
+            v === 1 ||
+            v === "1" ||
+            v === true ||
+            String(v).toUpperCase() === "TRUE"
+          );
+        })
+        .map((k) => k.slice(4));
+      // If the role has a special 'all' indicator via a permission, capture that too
+      creatorHasAll = creatorPerms.includes("all");
+    }
+
     for (const item of items) {
+      // Validate that the requested permissions are a subset of the creator's perms
+      const requested = Array.isArray(item.permissions) ? item.permissions : [];
+      // ensure all requested are strings
+      for (const rp of requested) {
+        if (typeof rp !== "string")
+          return res
+            .status(400)
+            .json({ error: "permissions must be an array of strings" });
+      }
+      if (!creatorHasAll) {
+        const invalid = requested.filter((p) => !creatorPerms.includes(p));
+        if (invalid.length > 0) {
+          return res.status(403).json({
+            error: "Forbidden: cannot grant permissions you don't have",
+            invalid_permissions: invalid,
+          });
+        }
+      }
+
+      // proceed to create key
       const raw = crypto.randomBytes(32).toString("hex");
       const keyHash = crypto.createHash("sha256").update(raw).digest("hex");
       const publicId = generatePublicIds("api_key");

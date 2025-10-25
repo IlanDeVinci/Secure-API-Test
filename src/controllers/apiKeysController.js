@@ -56,7 +56,6 @@ export const createApiKeys = async (req, res) => {
         })
         .map((k) => k.slice(4));
       // Consider the user an admin if the role name is 'admin'.
-      // (There is no special creator 'all' permission to rely on.)
       creatorIsAdmin = (roleRow.role_name || "").toLowerCase() === "admin";
     }
 
@@ -70,10 +69,7 @@ export const createApiKeys = async (req, res) => {
             .status(400)
             .json({ error: "permissions must be an array of strings" });
       }
-      // If the request asks for the special "all" permission, do NOT store
-      // the literal "all" string on the new API key. Instead expand it into
-      // the full set of permissions the creator actually has. This avoids
-      // giving a magic "all" token and keeps permissions explicit.
+
       let requestedProcessed = requested.slice();
       const wantsAll = requested.includes("all");
       if (wantsAll) {

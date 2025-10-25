@@ -26,7 +26,6 @@ export const createApiKeys = async (req, res) => {
     // Determine the creator's effective permissions so we can ensure
     // they cannot grant permissions they don't have.
     let creatorPerms = [];
-    let creatorHasAll = false; // whether the creator can grant any permission
     let creatorIsAdmin = false; // whether the creator is an admin (has all perms by role)
     let roleRow = {}; // populated for user-account creators so we can introspect can_* columns
     if (req.user?.is_api_key) {
@@ -34,7 +33,7 @@ export const createApiKeys = async (req, res) => {
         ? req.user.permissions
         : [];
 
-      creatorHasAll = creatorPerms.includes("all");
+      // API keys are never considered admins here
       creatorIsAdmin = false;
     } else {
       // Resolve role permissions for the authenticated user
@@ -56,13 +55,9 @@ export const createApiKeys = async (req, res) => {
           );
         })
         .map((k) => k.slice(4));
-      // If the role has a special 'all' indicator via a permission, capture that too
-      creatorHasAll = creatorPerms.includes("all");
-      // Consider the user an admin if the role name is 'admin' or the role
-      // includes an explicit 'all' permission. Granting the special
-      // "all" permission to newly created keys requires admin.
-      creatorIsAdmin =
-        (roleRow.role_name || "").toLowerCase() === "admin" || creatorHasAll;
+      // Consider the user an admin if the role name is 'admin'.
+      // (There is no special creator 'all' permission to rely on.)
+      creatorIsAdmin = (roleRow.role_name || "").toLowerCase() === "admin";
     }
 
     for (const item of items) {
@@ -84,31 +79,26 @@ export const createApiKeys = async (req, res) => {
       if (wantsAll) {
         if (req.user?.is_api_key) {
           // For API-key-created keys, grant whatever permissions the API key
-          // creator currently has (excluding the literal 'all').
-          requestedProcessed = creatorPerms.filter((p) => p !== "all");
+          // creator currently has.
+          requestedProcessed = creatorPerms.slice();
         } else {
-          // For user-role creators: if their creatorPerms already lists
-          // concrete permissions, use those. If the role only contains a
-          // generic 'all' flag, derive the full list of possible permissions
-          // from the role row's can_* columns.
-          const concrete = creatorPerms.filter((p) => p !== "all");
-          if (concrete.length > 0) {
-            requestedProcessed = concrete;
-          } else {
-            // Derive all permission names from roleRow columns like can_<perm>
+          // For user-role creators: if they are admin, derive the full list
+          // of permissions from the role's can_* columns; otherwise grant
+          // only the concrete permissions the role currently has.
+          if (creatorIsAdmin) {
             requestedProcessed = Object.keys(roleRow)
               .filter((k) => k.startsWith("can_"))
-              .map((k) => k.slice(4))
-              .filter((p) => p !== "all");
+              .map((k) => k.slice(4));
+          } else {
+            requestedProcessed = creatorPerms.slice();
           }
         }
       }
 
-      // For any other permissions, ensure the requested permissions are a
-      // subset of the creator's permissions unless the creator has the
-      // generic 'all' capability themselves.
+      // finalRequested must be a subset of the creator's concrete permissions
+      // unless the creator is an admin (admins may grant any permissions).
       const finalRequested = requestedProcessed;
-      if (!creatorHasAll) {
+      if (!creatorIsAdmin) {
         const invalid = finalRequested.filter((p) => !creatorPerms.includes(p));
         if (invalid.length > 0) {
           return res.status(403).json({

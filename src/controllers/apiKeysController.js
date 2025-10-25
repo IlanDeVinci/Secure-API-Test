@@ -26,19 +26,23 @@ export const createApiKeys = async (req, res) => {
     // Determine the creator's effective permissions so we can ensure
     // they cannot grant permissions they don't have.
     let creatorPerms = [];
-    let creatorHasAll = false;
+    let creatorHasAll = false; // whether the creator can grant any permission
+    let creatorIsAdmin = false; // whether the creator is an admin (has all perms by role)
+    let roleRow = {}; // populated for user-account creators so we can introspect can_* columns
     if (req.user?.is_api_key) {
       creatorPerms = Array.isArray(req.user.permissions)
         ? req.user.permissions
         : [];
+
       creatorHasAll = creatorPerms.includes("all");
+      creatorIsAdmin = false;
     } else {
       // Resolve role permissions for the authenticated user
       const roleRes = await turso.execute({
         sql: "SELECT r.* FROM roles r JOIN users u ON u.role_id = r.id WHERE u.id = ? LIMIT 1",
         args: [req.user.id],
       });
-      const roleRow = roleRes.rows[0] || {};
+      roleRow = roleRes.rows[0] || {};
       // Build permission names from columns like `can_<permission>`
       creatorPerms = Object.keys(roleRow)
         .filter((k) => k.startsWith("can_"))
@@ -54,6 +58,11 @@ export const createApiKeys = async (req, res) => {
         .map((k) => k.slice(4));
       // If the role has a special 'all' indicator via a permission, capture that too
       creatorHasAll = creatorPerms.includes("all");
+      // Consider the user an admin if the role name is 'admin' or the role
+      // includes an explicit 'all' permission. Granting the special
+      // "all" permission to newly created keys requires admin.
+      creatorIsAdmin =
+        (roleRow.role_name || "").toLowerCase() === "admin" || creatorHasAll;
     }
 
     for (const item of items) {
@@ -66,8 +75,41 @@ export const createApiKeys = async (req, res) => {
             .status(400)
             .json({ error: "permissions must be an array of strings" });
       }
+      // If the request asks for the special "all" permission, do NOT store
+      // the literal "all" string on the new API key. Instead expand it into
+      // the full set of permissions the creator actually has. This avoids
+      // giving a magic "all" token and keeps permissions explicit.
+      let requestedProcessed = requested.slice();
+      const wantsAll = requested.includes("all");
+      if (wantsAll) {
+        if (req.user?.is_api_key) {
+          // For API-key-created keys, grant whatever permissions the API key
+          // creator currently has (excluding the literal 'all').
+          requestedProcessed = creatorPerms.filter((p) => p !== "all");
+        } else {
+          // For user-role creators: if their creatorPerms already lists
+          // concrete permissions, use those. If the role only contains a
+          // generic 'all' flag, derive the full list of possible permissions
+          // from the role row's can_* columns.
+          const concrete = creatorPerms.filter((p) => p !== "all");
+          if (concrete.length > 0) {
+            requestedProcessed = concrete;
+          } else {
+            // Derive all permission names from roleRow columns like can_<perm>
+            requestedProcessed = Object.keys(roleRow)
+              .filter((k) => k.startsWith("can_"))
+              .map((k) => k.slice(4))
+              .filter((p) => p !== "all");
+          }
+        }
+      }
+
+      // For any other permissions, ensure the requested permissions are a
+      // subset of the creator's permissions unless the creator has the
+      // generic 'all' capability themselves.
+      const finalRequested = requestedProcessed;
       if (!creatorHasAll) {
-        const invalid = requested.filter((p) => !creatorPerms.includes(p));
+        const invalid = finalRequested.filter((p) => !creatorPerms.includes(p));
         if (invalid.length > 0) {
           return res.status(403).json({
             error: "Forbidden: cannot grant permissions you don't have",
@@ -80,7 +122,14 @@ export const createApiKeys = async (req, res) => {
       const raw = crypto.randomBytes(32).toString("hex");
       const keyHash = crypto.createHash("sha256").update(raw).digest("hex");
       const publicId = generatePublicIds("api_key");
-      const permsJson = JSON.stringify(item.permissions || []);
+      // Use the processed permissions (expanded 'all' -> explicit perms)
+      const permsToStore = Array.isArray(item.permissions)
+        ? // if we expanded above, use that; otherwise use the requested array
+          requestedProcessed && requestedProcessed.length > 0
+          ? requestedProcessed
+          : item.permissions
+        : [];
+      const permsJson = JSON.stringify(permsToStore || []);
       await turso.execute({
         sql: "INSERT INTO api_keys (public_id, key_hash, name, owner_user_id, permissions) VALUES (?, ?, ?, ?, ?)",
         args: [publicId, keyHash, item.name, req.user.id, permsJson],
